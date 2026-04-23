@@ -63,11 +63,25 @@ class TTSClient:
             "X-Api-Resource-Id": RESOURCE_ID,
             "X-Api-Connect-Id": self._connect_id,
         }
-        self._ws = await websockets.connect(
-            TTS_URL,
-            additional_headers=headers,
-            ping_interval=None,
-        )
+
+        # Retry the WS handshake on transient TLS/TCP resets (Volcengine
+        # edge occasionally drops a new connection mid-TLS).
+        last_exc = None
+        for attempt in range(3):
+            try:
+                self._ws = await websockets.connect(
+                    TTS_URL,
+                    additional_headers=headers,
+                    ping_interval=None,
+                    open_timeout=8,
+                )
+                break
+            except (ConnectionResetError, OSError, TimeoutError) as e:
+                last_exc = e
+                log.warning("TTS connect attempt %d/3 failed: %s", attempt + 1, e)
+                await asyncio.sleep(0.3 * (attempt + 1))
+        else:
+            raise RuntimeError(f"TTS upstream unreachable after 3 attempts: {last_exc}")
 
         # StartConnection → wait ConnectionStarted
         await self._ws.send(VolcengineTTSFunctions.start_connection_payload())

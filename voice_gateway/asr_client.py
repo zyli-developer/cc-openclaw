@@ -66,11 +66,27 @@ class ASRClient:
             "X-Api-Resource-Id": RESOURCE_ID,
             "X-Api-Connect-Id": self._connect_id,
         }
-        self._ws = await websockets.connect(
-            ASR_URL,
-            additional_headers=headers,
-            ping_interval=None,
-        )
+
+        # Retry the WS handshake on transient TLS/TCP resets. Volcengine's
+        # edge occasionally drops a new connection mid-TLS; the same creds
+        # and URL succeed 200-500ms later.
+        import asyncio
+        last_exc = None
+        for attempt in range(3):
+            try:
+                self._ws = await websockets.connect(
+                    ASR_URL,
+                    additional_headers=headers,
+                    ping_interval=None,
+                    open_timeout=8,
+                )
+                break
+            except (ConnectionResetError, OSError, TimeoutError) as e:
+                last_exc = e
+                log.warning("ASR connect attempt %d/3 failed: %s", attempt + 1, e)
+                await asyncio.sleep(0.3 * (attempt + 1))
+        else:
+            raise RuntimeError(f"ASR upstream unreachable after 3 attempts: {last_exc}")
 
         # First frame: full client request with audio + request config.
         req = VolcengineAsrRequestV3(
