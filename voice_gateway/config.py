@@ -1,7 +1,22 @@
-"""Voice gateway configuration. Loads doubao credentials from environment."""
+"""Voice gateway configuration.
+
+Runtime credentials come from `voice-web/.env.local` (auto-loaded by
+`server.py` at startup):
+
+  DOUBAO_APP_ID        — Volcengine/Doubao app id (numeric string)
+  DOUBAO_ACCESS_TOKEN  — Volcengine/Doubao access token
+
+These two authenticate both the standalone streaming ASR
+(volc.bigasr.sauc.duration) and the TTS-SeedTTS2.0 product that our
+/asr and /tts routes use. No separate AI-Gateway key is required.
+
+The legacy E2E dialogue client (session.py / doubao_client.py) still uses
+these same creds for cc-openclaw's own voice-web; we don't touch that path.
+"""
 import os
 import uuid
 
+# ─── Doubao E2E realtime dialogue (legacy /ws route — cc-openclaw voice-web) ──
 DOUBAO_WS_URL = "wss://openspeech.bytedance.com/api/v3/realtime/dialogue"
 
 
@@ -15,6 +30,7 @@ def get_ws_headers() -> dict:
     }
 
 
+# Initial session config for cc-openclaw's voice-web E2E mode.
 START_SESSION_CONFIG = {
     "tts": {
         "audio_config": {
@@ -51,24 +67,13 @@ START_SESSION_CONFIG = {
 GREETING_TEXT = "你好，请问有什么可以帮你？"
 COMFORT_TEXT = "稍等，我帮你查一下。"
 
-# Realtime API (split mode: separate ASR + TTS)
-REALTIME_ASR_URL = "wss://ai-gateway.vei.volces.com/v1/realtime?model=bigmodel"
-REALTIME_TTS_URL = "wss://ai-gateway.vei.volces.com/v1/realtime?model=doubao-tts"
-REALTIME_TTS_VOICE = "zh_female_vv_jupiter_bigtts"
-REALTIME_TTS_SAMPLE_RATE = 24000
 
-
-def get_realtime_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {os.environ.get('VOLCENGINE_API_KEY', '')}",
-    }
-
-
-# Channel server connection (actor model bridge)
+# ─── cc-openclaw channel_server bridge (E2E session.py actor model) ──
 CHANNEL_SERVER_WS_URL = os.environ.get("CHANNEL_SERVER_WS_URL", "ws://127.0.0.1:8765/ws/cc")
 VOICE_INSTANCE_PREFIX = "voice:user"
 
-# CORS allowlist (comma-separated origins) for /asr and /tts browser clients.
-# Empty string → disabled (reject all cross-origin). Use "*" only in dev.
+
+# ─── CORS allowlist (for /asr + /tts browser clients) ──
+# Comma-separated origins; empty = disabled. Use "*" only in dev.
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",")
 ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
