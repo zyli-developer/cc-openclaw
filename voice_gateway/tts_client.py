@@ -131,6 +131,25 @@ class TTSClient:
                 raise RuntimeError(f"TTS upstream error event={event.name} payload={payload}")
             # Other events (e.g. USAGE) — ignore
 
+    async def _drain_stale_frames(self) -> int:
+        """Consume any frames still queued from a previously-cancelled task.
+
+        When the route-level task is cancelled mid-synthesis the server does
+        NOT know — it keeps streaming audio for the old TaskRequest. If we
+        send a new TaskRequest immediately, the recv loop picks up the old
+        audio tail and thinks the new task is done (0 bytes yielded).
+
+        Drain first: grab everything already queued (with a short idle
+        threshold) so the next TaskRequest starts from a quiescent stream.
+        """
+        drained = 0
+        while True:
+            try:
+                msg = await asyncio.wait_for(self._ws.recv(), 0.08)
+                drained += 1
+            except asyncio.TimeoutError:
+                return drained
+
     async def synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
         """Ask Doubao to synthesize `text`. Yield PCM chunks as they stream back.
 
@@ -140,6 +159,10 @@ class TTSClient:
         """
         if not self._ws or not self._session_started:
             raise RuntimeError("TTSClient not connected")
+
+        drained = await self._drain_stale_frames()
+        if drained:
+            log.info("TTS drained %d stale frames before new TaskRequest", drained)
 
         audio_params = {
             "format": "pcm",

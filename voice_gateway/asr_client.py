@@ -87,6 +87,12 @@ class ASRClient:
                 enable_itn=True,
                 enable_punc=True,
                 show_utterances=True,  # needed for utterance-level 'definite' flag
+                # Aggressive VAD for responsive turn-taking. Defaults are tuned
+                # for long-form dictation (3000ms / 800ms) which feels sluggish
+                # for conversational voice — users wait 3 seconds after they
+                # stop talking before the system responds. Bring both down.
+                vad_segment_duration=800,
+                end_window_size=400,
             ),
         )
         self._seq = 1
