@@ -50,12 +50,31 @@ class TTSClient:
         self._session_started = False
 
     async def connect(self) -> None:
+        """Public connect() is now a no-op — the Doubao WS is opened lazily
+        on the first synthesize() call.
+
+        Why: the v3/tts/bidirection session enters a degraded state if idle
+        for ~15s between StartSession and first TaskRequest (manifests as
+        SentenceStart+SentenceEnd back-to-back with 0 audio bytes). In the
+        real browser flow the idle gap is typically the user's speaking
+        time plus ASR processing — easily >15s. Opening the upstream WS
+        right before the first TaskRequest avoids that idle window entirely.
+
+        Kept for interface symmetry with AsrClient.connect().
+        """
         app_id = os.environ.get("DOUBAO_APP_ID", "")
         token = os.environ.get("DOUBAO_ACCESS_TOKEN", "")
         if not app_id or not token:
             raise RuntimeError(
                 "DOUBAO_APP_ID / DOUBAO_ACCESS_TOKEN missing from environment"
             )
+        log.info("TTS client initialized (will connect lazily on first synthesize)")
+
+    async def _lazy_connect(self) -> None:
+        """Actually open the Doubao WS and complete StartConnection +
+        StartSession. Called from synthesize() on first invocation."""
+        app_id = os.environ["DOUBAO_APP_ID"]
+        token = os.environ["DOUBAO_ACCESS_TOKEN"]
 
         headers = {
             "X-Api-App-Key": app_id,
@@ -167,12 +186,12 @@ class TTSClient:
     async def synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
         """Ask Doubao to synthesize `text`. Yield PCM chunks as they stream back.
 
-        Works for arbitrary number of calls on the same WebSocket connection —
-        there's no per-utterance reconnect, which is why v3 bidirection beats
-        the E2E-dialogue workaround.
+        The upstream WS is opened lazily on the first call — see connect()
+        docstring for why. Subsequent calls reuse the same connection.
         """
-        if not self._ws or not self._session_started:
-            raise RuntimeError("TTSClient not connected")
+        if not self._session_started:
+            # First call → actually open Doubao WS and start session.
+            await self._lazy_connect()
 
         drained = await self._drain_stale_frames()
         if drained:
