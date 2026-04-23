@@ -1,143 +1,231 @@
-"""TTS client — Doubao E2E adapter.
+"""TTS client — Volcengine Bigmodel Bidirectional Streaming TTS v3 (true split mode).
 
-Uses the Doubao E2E realtime dialogue API (DOUBAO_APP_ID / DOUBAO_ACCESS_TOKEN)
-as a transport to directly synthesize a given text via the `chat_tts_text`
-event (which bypasses Doubao's LLM and makes it speak the provided text
-directly). Audio chunks are yielded as they arrive from the server.
+Uses the standalone Volcengine TTS product at
+`wss://openspeech.bytedance.com/api/v3/tts/bidirection`. This product does TTS
+*only* — no LLM, no ASR. Each ASR-turn / CC-reply text gets synthesized here.
+
+Key property: one WebSocket connection handles *multiple* synthesize() calls —
+no per-utterance reconnect like the E2E-dialogue workaround we had before.
+Comfort text + CC reply + subsequent turns all share the same session.
+
+Auth: X-Api-App-Key + X-Api-Access-Key + X-Api-Resource-Id=seed-tts-1.0 (uses
+the same DOUBAO_APP_ID / DOUBAO_ACCESS_TOKEN account credentials).
+
+Binary protocol generated and parsed by the `volcengine-audio` SDK helpers.
 """
+import asyncio
 import logging
+import os
 import uuid
 from typing import AsyncGenerator
 
-from config import START_SESSION_CONFIG
-from doubao_client import DoubaoClient
-from protocol import (
-    EVENT_CONNECTION_FAILED,
-    EVENT_CONNECTION_STARTED,
-    EVENT_SESSION_FAILED,
-    EVENT_SESSION_FINISHED,
-    EVENT_SESSION_STARTED,
-    EVENT_TTS_ENDED,
-    EVENT_TTS_RESPONSE,
+import websockets
+
+from volcengine_audio import (
+    EventReceive,
+    EventSend,
+    MessageType,
+    VolcengineTTSFunctions,
 )
 
 log = logging.getLogger(__name__)
+
+TTS_URL = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
+# Resource_id is bound to the TTS instance opened on Volcengine. seed-tts-2.0
+# uses model "seed-tts-2.0-standard" (or "-expressive") and a distinct speaker
+# catalog (*_uranus_bigtts / saturn_*_tob / etc.) — see your console's
+# "音色详情" for the exact names your instance provides.
+RESOURCE_ID = os.environ.get("DOUBAO_TTS_RESOURCE_ID", "seed-tts-2.0")
+DEFAULT_MODEL = os.environ.get("DOUBAO_TTS_MODEL", "seed-tts-2.0-standard")
+DEFAULT_SPEAKER = os.environ.get("DOUBAO_TTS_SPEAKER", "zh_female_vv_uranus_bigtts")
+DEFAULT_SAMPLE_RATE = 24000
 
 
 class TTSClient:
     def __init__(self):
         self.session_id = str(uuid.uuid4())
-        self._doubao = DoubaoClient(self.session_id)
-        self._receiver = None  # async generator of parsed Doubao frames
-        self._first_synthesis = True
+        self._connect_id = str(uuid.uuid4())
+        self._ws = None
+        self._connection_started = False
+        self._session_started = False
 
     async def connect(self) -> None:
-        await self._doubao.connect()
-        self._receiver = self._doubao.receive()
+        app_id = os.environ.get("DOUBAO_APP_ID", "")
+        token = os.environ.get("DOUBAO_ACCESS_TOKEN", "")
+        if not app_id or not token:
+            raise RuntimeError(
+                "DOUBAO_APP_ID / DOUBAO_ACCESS_TOKEN missing from environment"
+            )
 
-        await self._doubao.send_start_connection()
-        await self._wait_for(
-            EVENT_CONNECTION_STARTED,
-            error_events=(EVENT_CONNECTION_FAILED,),
+        headers = {
+            "X-Api-App-Key": app_id,
+            "X-Api-Access-Key": token,
+            "X-Api-Resource-Id": RESOURCE_ID,
+            "X-Api-Connect-Id": self._connect_id,
+        }
+        self._ws = await websockets.connect(
+            TTS_URL,
+            additional_headers=headers,
+            ping_interval=None,
         )
-        await self._doubao.send_start_session(START_SESSION_CONFIG)
-        await self._wait_for(
-            EVENT_SESSION_STARTED,
-            error_events=(EVENT_SESSION_FAILED,),
+
+        # StartConnection → wait ConnectionStarted
+        await self._ws.send(VolcengineTTSFunctions.start_connection_payload())
+        await self._expect_event(EventReceive.ConnectionStarted, timeout=5.0)
+        self._connection_started = True
+
+        # StartSession req_params — speaker must match the voice catalog
+        # enabled on the TTS instance (see console "音色详情" tab).
+        start_req_params = {
+            "model": DEFAULT_MODEL,
+            "speaker": DEFAULT_SPEAKER,
+            "audio_params": {
+                "format": "pcm",
+                "sample_rate": DEFAULT_SAMPLE_RATE,
+            },
+        }
+        await self._ws.send(
+            VolcengineTTSFunctions.start_session_payload(
+                session_id=self.session_id,
+                req_params=start_req_params,
+                user_info={"uid": self.session_id},
+            )
         )
-        log.info("TTS ready (Doubao E2E, session=%s)", self.session_id[:8])
+        server_sid, _ = await self._expect_event(EventReceive.SessionStarted, timeout=5.0)
+        # Server may re-assign the session_id — use its value going forward.
+        if server_sid:
+            self.session_id = server_sid
+        self._session_started = True
+        log.info("TTS connected (Volcengine bigmodel bidirection, server session=%s)", self.session_id[:12])
 
-    async def _wait_for(self, target_event: int, error_events: tuple = ()) -> dict:
-        if self._receiver is None:
-            raise RuntimeError("TTSClient not connected")
-        async for frame in self._receiver:
-            ev = frame.get("event")
-            if ev == target_event:
-                return frame
-            if ev in error_events:
-                raise RuntimeError(
-                    f"Doubao rejected: event={ev} payload={frame.get('payload_msg')}"
-                )
-            if frame.get("message_type") == "SERVER_ERROR":
-                raise RuntimeError(
-                    f"Doubao server error {frame.get('code')}: {frame.get('payload_msg')}"
-                )
-        raise RuntimeError("Doubao stream ended before event %d arrived" % target_event)
+    async def _expect_event(self, target: EventReceive, timeout: float = 5.0):
+        """Drain frames until we see `target` or hit timeout/error.
 
-    async def _reopen(self) -> None:
-        """Close the current Doubao connection and open a fresh one.
-
-        Doubao's `say_hello` event only triggers TTS once per WebSocket
-        connection; `chat_tts_text` requires conversational context that's
-        absent in our split-mode use case. Workaround: fully reconnect
-        between synthesize calls. Cost: ~300-500ms per call.
+        Returns (session_id_from_server, payload) — the server may re-assign
+        session_id at ConnectionStarted/SessionStarted; subsequent frames must
+        use the server-issued value.
         """
-        try:
-            await self._doubao.close()
-        except Exception:
-            pass
-        self.session_id = str(uuid.uuid4())
-        self._doubao = DoubaoClient(self.session_id)
-        await self._doubao.connect()
-        self._receiver = self._doubao.receive()
-        await self._doubao.send_start_connection()
-        await self._wait_for(
-            EVENT_CONNECTION_STARTED,
-            error_events=(EVENT_CONNECTION_FAILED,),
-        )
-        await self._doubao.send_start_session(START_SESSION_CONFIG)
-        await self._wait_for(
-            EVENT_SESSION_STARTED,
-            error_events=(EVENT_SESSION_FAILED,),
-        )
-        log.info("TTS re-opened (Doubao E2E, session=%s)", self.session_id[:8])
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for {target.name}")
+            msg = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+            if not isinstance(msg, (bytes, bytearray)):
+                continue
+            event, sid, payload = VolcengineTTSFunctions.extract_response_payload(bytes(msg))
+            log.debug("TTS recv event=%s sid=%s payload=%s",
+                      event.name if hasattr(event, 'name') else event,
+                      sid, str(payload)[:120])
+            if event == target:
+                return sid, payload
+            if event in (
+                EventReceive.ConnectionFailed,
+                EventReceive.SessionFailed,
+                EventReceive.DialogCommonError,
+                EventReceive.INVALID_MODEL,
+                EventReceive.SERVER_PROCESSING_ERROR,
+                EventReceive.SERVICE_UNAVAILABLE,
+                EventReceive.AUDIO_FLOW_ERROR,
+            ):
+                raise RuntimeError(f"TTS upstream error event={event.name} payload={payload}")
+            # Other events (e.g. USAGE) — ignore
 
     async def synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Ask Doubao to speak `text`. Yield PCM chunks.
+        """Ask Doubao to synthesize `text`. Yield PCM chunks as they stream back.
 
-        Uses `say_hello` (Doubao's reliable TTS trigger). For every synthesis
-        after the first, we first reconnect to Doubao — `say_hello` only
-        works once per WS connection.
+        Works for arbitrary number of calls on the same WebSocket connection —
+        there's no per-utterance reconnect, which is why v3 bidirection beats
+        the E2E-dialogue workaround.
         """
-        if self._receiver is None:
+        if not self._ws or not self._session_started:
             raise RuntimeError("TTSClient not connected")
 
-        if not self._first_synthesis:
-            log.info("TTS reconnecting for re-use")
-            await self._reopen()
-        self._first_synthesis = False
+        audio_params = {
+            "format": "pcm",
+            "sample_rate": DEFAULT_SAMPLE_RATE,
+        }
+        frame = VolcengineTTSFunctions.task_request_payload(
+            session_id=self.session_id,
+            text=text,
+            speaker=DEFAULT_SPEAKER,
+            audio_params=audio_params,
+        )
+        await self._ws.send(bytes(frame))
 
-        log.info("TTS synthesize (say_hello): %r", text[:60])
-        await self._doubao.send_say_hello(text)
+        log.debug("TTS sent TaskRequest: text=%r speaker=%s", text[:60], DEFAULT_SPEAKER)
 
+        # The v3 bidirection product is designed for continuous use — the
+        # server emits audio chunks but does NOT fire a per-utterance end
+        # marker (TTSSentenceEnd/TTSEnded only fire at FinishSession time on
+        # many configs). So we detect per-text completion heuristically:
+        # after the first audio chunk, any silence ≥ SILENCE_TIMEOUT means
+        # "this synthesis is done, ready for the next TaskRequest".
+        FIRST_CHUNK_TIMEOUT = 15.0   # Generous: Doubao can take a few seconds to start
+        SILENCE_TIMEOUT = 0.8        # After first audio, short silence = done
         audio_bytes = 0
-        async for frame in self._receiver:
-            event = frame.get("event")
-            payload = frame.get("payload_msg")
+        got_first_audio = False
 
-            if event == EVENT_TTS_RESPONSE and isinstance(payload, bytes):
-                audio_bytes += len(payload)
-                yield payload
-
-            elif event == EVENT_TTS_ENDED:
-                log.info("TTS synthesize done (%d bytes)", audio_bytes)
-                break
-
-            elif frame.get("message_type") == "SERVER_ERROR":
+        while True:
+            try:
+                timeout = SILENCE_TIMEOUT if got_first_audio else FIRST_CHUNK_TIMEOUT
+                msg = await asyncio.wait_for(self._ws.recv(), timeout)
+            except asyncio.TimeoutError:
+                if got_first_audio:
+                    log.info("TTS synthesize done via silence (%d bytes)", audio_bytes)
+                    return
                 raise RuntimeError(
-                    f"Doubao TTS server error {frame.get('code')}: {payload}"
+                    f"TTS timed out waiting for first audio chunk ({FIRST_CHUNK_TIMEOUT}s)"
                 )
 
-            else:
-                log.debug("TTS unexpected event %s: %s", event, str(payload)[:120])
+            if not isinstance(msg, (bytes, bytearray)):
+                continue
+            event, _sid, payload = VolcengineTTSFunctions.extract_response_payload(bytes(msg))
+            log.debug("TTS event=%s payload_len=%s",
+                      event.name if hasattr(event, 'name') else event,
+                      len(payload) if isinstance(payload, (bytes, bytearray, str, dict, list)) else '?')
+
+            if event == EventReceive.TTSResponse:
+                if isinstance(payload, (bytes, bytearray)) and payload:
+                    audio_bytes += len(payload)
+                    got_first_audio = True
+                    yield bytes(payload)
+
+            elif event in (EventReceive.TTSSentenceEnd, EventReceive.TTSEnded):
+                # Explicit end — great, use it.
+                log.info("TTS synthesize done via %s (%d bytes)", event.name, audio_bytes)
+                return
+
+            elif event in (
+                EventReceive.SessionFailed,
+                EventReceive.SessionCanceled,
+                EventReceive.DialogCommonError,
+                EventReceive.SERVER_PROCESSING_ERROR,
+                EventReceive.SERVICE_UNAVAILABLE,
+                EventReceive.AUDIO_FLOW_ERROR,
+            ):
+                raise RuntimeError(f"TTS synthesize error event={event.name} payload={payload}")
+
+            # TTSSentenceStart / TTSSubtitle / USAGE — ignore
 
     async def close(self) -> None:
+        if not self._ws:
+            return
         try:
-            await self._doubao.send_finish_session()
+            if self._session_started:
+                await self._ws.send(
+                    VolcengineTTSFunctions.finish_session_payload(self.session_id)
+                )
         except Exception:
             pass
         try:
-            await self._doubao.send_finish_connection()
+            if self._connection_started:
+                await self._ws.send(VolcengineTTSFunctions.finish_connection_payload())
         except Exception:
             pass
-        await self._doubao.close()
+        try:
+            await self._ws.close()
+        except Exception:
+            pass
+        self._ws = None
+        log.info("TTS closed (session=%s)", self.session_id[:8])
