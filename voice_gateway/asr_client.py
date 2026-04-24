@@ -182,6 +182,7 @@ class ASRClient:
                 if u.get("definite") and i >= self._finalized_utterances:
                     utext = (u.get("text") or "").strip()
                     if utext:
+                        log.info("ASR final: %r", utext[:60])
                         yield {
                             "type": "conversation.item.input_audio_transcription.completed",
                             "transcript": utext,
@@ -204,6 +205,7 @@ class ASRClient:
             if pending_text:
                 if not self._speech_started_sent:
                     self._speech_started_sent = True
+                    log.info("ASR speech_started (first partial: %r)", pending_text[:30])
                     yield {"type": "input_audio_buffer.speech_started"}
                 yield {
                     "type": "conversation.item.input_audio_transcription.result",
