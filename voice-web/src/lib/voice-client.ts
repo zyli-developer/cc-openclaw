@@ -14,8 +14,11 @@ export class VoiceClient {
   public onError: OnErrorCallback = () => {};
 
   start(config?: { systemRole?: string; greeting?: string; comfortText?: string; mode?: string }): void {
+    // Local-dev override: point at voice_gateway on :8089 (prod deploys use reverse proxy).
+    // Env var takes priority; defaults to same-origin /ws for prod.
+    const envUrl = process.env.NEXT_PUBLIC_VOICE_WS_URL;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const wsUrl = envUrl || `${protocol}//${window.location.host}/ws`;
 
     this.ws = new WebSocket(wsUrl);
     this.ws.binaryType = 'arraybuffer';
